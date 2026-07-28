@@ -40,6 +40,70 @@ POD_LABEL="app=product-service"
 MAX_WAIT_OOM_MIN=15
 POLL_SEC=10
 
+# ===== DuckDNS (optionnel, activé par défaut) =====
+# k6_oom_ramp.js cible nexshop-mab.duckdns.org par défaut -- si le cluster a été
+# redimensionné entre deux runs, l'IP externe du nœud change mais DuckDNS peut
+# encore pointer vers l'ancienne. Vécu en pratique : ~11 minutes d'un run de 24min
+# perdues en "dial: i/o timeout" avant de s'en rendre compte. On met à jour
+# systématiquement AVANT que k6 ne démarre, plutôt que de compter sur d'y penser
+# manuellement à chaque fois.
+DUCKDNS_UPDATE="${DUCKDNS_UPDATE:-1}"
+DUCKDNS_DOMAIN="${DUCKDNS_DOMAIN:-nexshop-mab}"
+DUCKDNS_TOKEN="${DUCKDNS_TOKEN:-743cbc45-8eb5-4c89-9848-fea68cbb0660}"
+
+K6_BASE_URL=""
+K6_KEYCLOAK_URL=""
+
+update_duckdns() {
+  # DuckDNS mis à jour quand même pour un accès humain pratique (navigateur, curl
+  # manuel) -- mais k6 lui-même NE DÉPEND PLUS de cette résolution DNS du tout
+  # (voir discover_k6_targets plus bas). Vécu en pratique : même après une mise à
+  # jour DuckDNS confirmée par nslookup, les VUs k6 ont continué à viser
+  # l'ancienne IP pendant plusieurs minutes -- cache DNS réparti sur plusieurs
+  # résolveurs intermédiaires (Cloud Shell, metadata GCP, DuckDNS lui-même), dont
+  # le délai de propagation réel est hors de notre contrôle.
+  if [ "$DUCKDNS_UPDATE" != "1" ]; then
+    echo "[$(date +%H:%M:%S)] Mise à jour DuckDNS désactivée (DUCKDNS_UPDATE=0)."
+    return 0
+  fi
+  local node_ip response
+  node_ip=$(kubectl_retry get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+  if [ -z "$node_ip" ]; then
+    echo "[$(date +%H:%M:%S)] [WARN] Impossible de récupérer une IP de nœud -- DuckDNS non mis à jour." >&2
+    return 0
+  fi
+  response=$(curl -sk "https://www.duckdns.org/update?domains=${DUCKDNS_DOMAIN}&token=${DUCKDNS_TOKEN}&ip=${node_ip}")
+  if [ "$response" = "OK" ]; then
+    echo "[$(date +%H:%M:%S)] DuckDNS mis à jour: ${DUCKDNS_DOMAIN}.duckdns.org -> $node_ip"
+  else
+    echo "[$(date +%H:%M:%S)] [WARN] Échec de la mise à jour DuckDNS (réponse: $response) -- sans conséquence pour k6 (voir discover_k6_targets)." >&2
+  fi
+}
+
+# discover_k6_targets : découvre l'IP d'un nœud + les NodePort réels d'api-gateway
+# et keycloak, pour que k6 tape directement dessus via -e BASE_URL=.../-e
+# KEYCLOAK_URL=... -- aucune résolution DNS en jeu pendant le run, donc plus aucun
+# risque de cache DNS périmé côté k6, quel que soit le délai de propagation
+# DuckDNS. Échec silencieux et non bloquant : si la découverte rate, k6 retombe
+# sur son URL DuckDNS par défaut (comportement d'avant, pas pire qu'avant).
+discover_k6_targets() {
+  local node_ip gateway_port keycloak_port
+  node_ip=$(kubectl_retry get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+  if [ -z "$node_ip" ]; then
+    echo "[$(date +%H:%M:%S)] [WARN] Pas d'IP de nœud -- k6 utilisera son URL DuckDNS par défaut." >&2
+    return 0
+  fi
+  gateway_port=$(kubectl_retry get svc -n "$NS" api-gateway -o jsonpath='{.spec.ports[?(@.port==9000)].nodePort}')
+  keycloak_port=$(kubectl_retry get svc -n "$NS" keycloak -o jsonpath='{.spec.ports[?(@.port==8080)].nodePort}')
+  if [ -z "$gateway_port" ] || [ -z "$keycloak_port" ]; then
+    echo "[$(date +%H:%M:%S)] [WARN] NodePort api-gateway/keycloak introuvable -- k6 utilisera son URL DuckDNS par défaut." >&2
+    return 0
+  fi
+  K6_BASE_URL="http://${node_ip}:${gateway_port}"
+  K6_KEYCLOAK_URL="http://${node_ip}:${keycloak_port}"
+  echo "[$(date +%H:%M:%S)] k6 ciblera directement (sans DNS) : BASE_URL=$K6_BASE_URL  KEYCLOAK_URL=$K6_KEYCLOAK_URL"
+}
+
 # Un CSV par run : plus simple à isoler/relancer/jeter individuellement.
 # La fusion en un seul dataset se fait après coup avec merge_csvs.py.
 mkdir -p runs
@@ -159,6 +223,9 @@ else
   echo "[$(date +%H:%M:%S)] Ingestion live désactivée (LIVE_PUSH=1 pour l'activer) -- CSV uniquement."
 fi
 
+update_duckdns
+discover_k6_targets
+
 # ===== ÉTAPE 0 : capturer les ressources actuelles =====
 ORIG_REQ=$(kubectl_retry get deployment "$DEPLOY" -n "$NS" -o jsonpath='{.spec.template.spec.containers[0].resources.requests.memory}')
 ORIG_LIM=$(kubectl_retry get deployment "$DEPLOY" -n "$NS" -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}')
@@ -189,7 +256,10 @@ BASE_RESTARTS=$(get_restart_count "$POD_NAME")
 echo "[$(date +%H:%M:%S)] patch appliqué, pod: $POD_NAME"
 
 # ===== ÉTAPE 3 : charge progressive =====
-k6 run "$K6_FAULT" > "k6_fault_${RUN_ID}.log" 2>&1 &
+K6_ENV_ARGS=()
+[ -n "$K6_BASE_URL" ] && K6_ENV_ARGS+=(-e "BASE_URL=$K6_BASE_URL")
+[ -n "$K6_KEYCLOAK_URL" ] && K6_ENV_ARGS+=(-e "KEYCLOAK_URL=$K6_KEYCLOAK_URL")
+k6 run "${K6_ENV_ARGS[@]}" "$K6_FAULT" > "k6_fault_${RUN_ID}.log" 2>&1 &
 K6_FAULT_PID=$!
 
 start_collector "during_fault" "oom"
